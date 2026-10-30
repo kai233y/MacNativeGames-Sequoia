@@ -31,6 +31,8 @@ def main():
     target.mkdir(parents=True)
     run('git', 'init', str(target))
     run('git', 'remote', 'add', 'origin', entry['repository'], cwd=target)
+    run('git', 'config', 'remote.origin.promisor', 'true', cwd=target)
+    run('git', 'config', 'remote.origin.partialclonefilter', 'blob:none', cwd=target)
     run('git', '-c', 'http.version=HTTP/1.1', 'fetch', '--depth=1', '--filter=blob:none', 'origin', entry['commit'], cwd=target)
     if args.game == 'botw160':
         run('git', 'sparse-checkout', 'init', '--cone', cwd=target)
@@ -39,7 +41,7 @@ def main():
     run('git', 'apply', '--check', str(patch), cwd=target)
     run('git', 'apply', str(patch), cwd=target)
     run('git', 'diff', '--check', cwd=target)
-    print(f'Ready: {target}\nRead docs/{args.game}-build.md before building. Gameplay testing is manual.')
+    print(f'Ready: {target}\nRead {ROOT / "docs" / (args.game + "-build.md")} before building. Gameplay testing is manual.')
 
 
 if __name__ == '__main__':
