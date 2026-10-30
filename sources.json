@@ -1,0 +1,14 @@
+{
+  "totk121": {
+    "repository": "https://github.com/1918662410-ship-it/MacNativeGames.git",
+    "commit": "f71ea7b56eb1f7064d5e753428cc6b05a124241b",
+    "patch": "patches/totk121-macos15.patch",
+    "patch_sha256": "45b8acbe7667ad30120770ab3dd0e5be928acb35fb7b0dd9ec285abf67ad0a47"
+  },
+  "botw160": {
+    "repository": "https://github.com/ly05010419/MacNativeGames.git",
+    "commit": "984ad05e927c65374f6bf504cdd5803e3b426792",
+    "patch": "patches/botw160-macos15.patch",
+    "patch_sha256": "1ce811b9c26c77d60dae88a7603bf35af95385afd281128986b0c18d60cb253a"
+  }
+}

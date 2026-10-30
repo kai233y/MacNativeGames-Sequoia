@@ -1,0 +1,917 @@
+diff --git a/build_app.py b/build_app.py
+index 3bf2f9c..be9a236 100644
+--- a/build_app.py
++++ b/build_app.py
+@@ -31,8 +31,9 @@ REPO = Path(__file__).resolve().parent
+ GAME = REPO / 'games/totk'
+ EXPECTED = json.loads((GAME / 'assets/expected-v1.0.0.json').read_text())
+ UPDATED = json.loads((GAME / 'assets/expected-v1.1.2.json').read_text())
++UPDATED121 = json.loads((GAME / 'assets/expected-v1.2.1.json').read_text())
+ UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
+-VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v143': UPDATED143}
++VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v121': UPDATED121, 'v143': UPDATED143}
+ HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
+ APP_NAME = 'Tears of the Kingdom'
+ BUNDLE_ID = 'org.macnativegames.totk'
+@@ -222,7 +223,7 @@ def prepare_update_container(tree, game, keys, logs):
+ def identify_update(tree, game, keys, logs):
+     """Choose the runtime by verified module bytes, never by the package filename."""
+     source = prepare_update_container(tree, game, keys, logs)
+-    for version in ('v112', 'v143'):
++    for version in ('v112', 'v121', 'v143'):
+         exefs = tree / f'extracted/{version}/exefs'
+         if source_matches(exefs.parent / 'extraction-manifest.json', source) and all(
+                 (exefs / name).is_file() and sha256(exefs / name) == digest
+@@ -233,10 +234,10 @@ def identify_update(tree, game, keys, logs):
+     run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', source, '--keys', keys,
+          '--update', '--output', staging / 'exefs'], logs / 'identify-update.log', cwd=tree)
+     actual = {path.name: sha256(path) for path in (staging / 'exefs').iterdir()}
+-    version = next((version for version in ('v112', 'v143')
++    version = next((version for version in ('v112', 'v121', 'v143')
+                     if actual == VERSIONS[version]['exefs_sha256']), None)
+     if version is None:
+-        raise BuildError('unsupported update module hashes; expected 1.1.2 or 1.4.3 (the file name is not used to choose a version)')
++        raise BuildError('unsupported update module hashes; expected 1.1.2, 1.2.1 or 1.4.3 (the file name is not used to choose a version)')
+     target = tree / f'extracted/{version}'
+     target.mkdir(parents=True, exist_ok=True)
+     if (target / 'exefs').exists(): shutil.rmtree(target / 'exefs')
+@@ -254,9 +255,13 @@ def font_report(folder):
+         path = folder / f'{kind}-{name}.bfttf'
+         if not path.is_file():
+             raise BuildError(f'missing shared font: {path}')
+-        check(f'shared font {name}', sha256(path), expected)
+         size = path.stat().st_size
+-        rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=expected))
++        rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=sha256(path)))
++    actual = {row['name']: row['sha256'] for row in rows}
++    known_sets = [EXPECTED['shared_fonts_sha256'],
++                  json.loads((GAME / 'assets/shared-fonts-22.1.0.json').read_text())['shared_fonts_sha256']]
++    if actual not in known_sets:
++        raise BuildError('shared font SHA-256 values do not match a complete verified font set')
+     return dict(status='pass', integrity='Each shared font matches the verified SHA-256 for this build', fonts=rows)
+ 
+ 
+@@ -281,6 +286,28 @@ def fonts_valid(folder):
+         return False
+ 
+ 
++def prepare_base_for_update(tree, game, keys, logs):
++    """The updated app uses the update's complete ExeFS, and only RomFS from the base.
++
++    Extract a verified base NCA manifest for the RomFS reader. Pin the base executable
++    modules too, but do not bind the unused base NPDM to the cartridge metadata hash:
++    NSP metadata can differ. The selected update's NPDM remains checked by step_code,
++    and the base and merged RomFS must still match their published SHA-256 values.
++    """
++    exefs = tree / 'extracted/v0/exefs'
++    expected = {name: digest for name, digest in EXPECTED['exefs_sha256'].items()
++                if name != 'main.npdm'}
++    if not source_matches(exefs.parent / 'extraction-manifest.json', game) or not all(
++            (exefs / name).is_file() and sha256(exefs / name) == digest
++            for name, digest in expected.items()):
++        if exefs.exists():
++            shutil.rmtree(exefs)
++        run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', game, '--keys', keys,
++             '--output', exefs], logs / 'extract-base-manifest.log', cwd=tree)
++    for name, digest in expected.items():
++        check(f'base ExeFS {name}', sha256(exefs / name), digest)
++
++
+ def step_code(tree, game, keys, env, logs, *, version="v0"):
+     expected = VERSIONS[version]
+     update_args = [] if version == "v0" else ["--update"]
+@@ -560,6 +587,11 @@ def sign_app(app, logs):
+     # executables keep their existing signatures and byte identity.
+     run(['codesign', '--force', '--sign', '-', app], logs / 'sign-app.log')
+     run(['codesign', '--verify', '--deep', '--strict', app], logs / 'verify-app-signature.log')
++    # This is a freshly compiled, locally sealed bundle. A quarantine attribute
++    # inherited from the build host can otherwise reject its ad-hoc signature.
++    attrs = subprocess.run(['xattr', app], capture_output=True, text=True, check=True).stdout.splitlines()
++    if 'com.apple.quarantine' in attrs:
++        run(['xattr', '-d', 'com.apple.quarantine', app], logs / 'clear-quarantine.log')
+ 
+ 
+ def step_app(tree, out, logs, *, version="v0"):
+@@ -628,13 +660,14 @@ def step_app(tree, out, logs, *, version="v0"):
+ 
+ 
+ def parse_args(argv):
+-    ap = argparse.ArgumentParser(description='Build one native macOS app from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2 or 1.4.3 update.',
++    ap = argparse.ArgumentParser(description='Build one native macOS app from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2, 1.2.1 or 1.4.3 update.',
+                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
+     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
+     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
+     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
+     ap.add_argument('-o', '--out', type=Path, help=f'the app to write (default: "{APP_NAME}.app" next to the game file)')
+     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
++    ap.add_argument('--skip-launch-check', action='store_true', help='finish after packaging and signature verification; let the user open and test the app')
+     fonts = ap.add_mutually_exclusive_group()
+     fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available)')
+     fonts.add_argument('--shared-fonts', type=Path, help='previously extracted shared-font directory containing the six verified .bfttf files')
+@@ -681,9 +714,11 @@ def main(argv):
+     tree = prepare_work(work, py, logs)
+     if update:
+         version, update = identify_update(tree, update, keys, logs)
+-    step_code(tree, game, keys, env, logs)
+     if update:
++        prepare_base_for_update(tree, game, keys, logs)
+         step_code(tree, update, keys, env, logs, version=version)
++    else:
++        step_code(tree, game, keys, env, logs)
+     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts)
+     if update:
+         step_update_data(tree, game, update, keys, logs, version=version)
+@@ -696,12 +731,15 @@ def main(argv):
+     run([LSREGISTER, '-f', out], logs / 'register-app.log')
+     # macOS scans a new app the first time it runs (minutes for 16 GB, with nothing on screen): run it once here, in its
+     # check-only mode, so the player's first start is immediate.
+-    say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')
+-    t1 = time.time()
+-    r = subprocess.run([out / 'Contents/MacOS/TOTK', '--check'], capture_output=True, text=True, timeout=1800)
+-    if r.returncode:
+-        raise BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
+-    say(f'   checked in {time.time() - t1:.0f} s')
++    if not args.skip_launch_check:
++        say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')
++        t1 = time.time()
++        r = subprocess.run([out / 'Contents/MacOS/TOTK', '--check'], capture_output=True, text=True, timeout=1800)
++        if r.returncode:
++            raise BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
++        say(f'   checked in {time.time() - t1:.0f} s')
++    else:
++        say('4/4 app: packaged and signature verified; launch and gameplay testing left to the user')
+     say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
+     say('Open it from Finder (or move it to /Applications first: moving within one volume keeps the check). The first '
+         'start verifies the game data, discovers the prepared startup shaders and warms them on your GPU. '
+diff --git a/games/totk/Makefile b/games/totk/Makefile
+index d909bd5..2c1a3ed 100644
+--- a/games/totk/Makefile
++++ b/games/totk/Makefile
+@@ -377,6 +377,23 @@ build/totk-native-v112-m3: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) bu
+ runtime-v112-m3: build/totk-native-v112-m3 build/pso_manifest.tsv
+ 
+ 
++# Isolated 1.2.1 build; never replace the validated v0 executable or generated headers.
++.PHONY: runtime-v121
++build/v121/runtime_tables.h: scripts/prepare_runtime.py analysis/v121-port/phase12-validation.json
++	"$(PY)" scripts/prepare_runtime.py --version v121
++build/v121/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v121/romfs/index.json
++	"$(PY)" scripts/prepare_romfs_backend.py --version v121
++build/totk-native-v121: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v121/runtime_tables.h build/v121/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
++	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V121=1 -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
++runtime-v121: build/totk-native-v121 build/pso_manifest.tsv
++
++# 1.2.1 on the macOS 15 / Metal 3 backend: the v121 tables and the M3 graphics objects together.
++.PHONY: runtime-v121-m3
++build/totk-native-v121-m3: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v121/runtime_tables.h build/v121/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS_M3) Makefile
++	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -mmacosx-version-min=$(MACOS_MIN_M3) -DDM_NVN_M3=1 -DTOTK_GAME_V121=1 -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS_M3) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
++runtime-v121-m3: build/totk-native-v121-m3 build/pso_manifest.tsv
++
++
+ # Isolated 1.4.3 build; never replace the validated v0 executable or generated headers.
+ .PHONY: runtime-v143
+ build/v143/runtime_tables.h: scripts/prepare_runtime.py analysis/v143-port/phase12-validation.json
+diff --git a/games/totk/app/launcher.m b/games/totk/app/launcher.m
+index fcd4f18..bfda806 100644
+--- a/games/totk/app/launcher.m
++++ b/games/totk/app/launcher.m
+@@ -482,7 +482,7 @@ - (void)launchProfile:(NSString *)profile mod:(NSString *)mod {
+         show_error([NSString stringWithFormat:@"Cannot create %@.", self.data]);
+         return;
+     }
+-#if defined(TOTK_GAME_V112) || defined(TOTK_GAME_V143)
++#if defined(TOTK_GAME_V112) || defined(TOTK_GAME_V121) || defined(TOTK_GAME_V143)
+     NSString *backup = [profile stringByAppendingFormat:@"-before-%s", TOTK_GAME_VERSION];
+     if (![fm fileExistsAtPath:backup]) {
+         NSString *temporary = [backup stringByAppendingFormat:@".copy-%d", getpid()];
+diff --git a/games/totk/runtime/game_version.h b/games/totk/runtime/game_version.h
+index cc489b5..2d1b746 100644
+--- a/games/totk/runtime/game_version.h
++++ b/games/totk/runtime/game_version.h
+@@ -50,6 +50,46 @@
+ #define GAME_ADDR_0x453f648 0x46129e0
+ #define GAME_ADDR_0x8f6cbc 0x81ff54
+ #define GAME_OUTPUT_CALL_WORD 0x94000083u
++#elif defined(TOTK_GAME_V121)
++/* Found from 1.1.2 by scripts/map_version_sites.py --from v112 --to v121 (every original word unchanged). */
++#define TOTK_GAME_VERSION "1.2.1"
++#define TOTK_GAME_DIR "v121"
++#define GAME_ACTOR_NAME 0x218
++#define GAME_ACTOR_POS 0x2b4
++#define GAME_ACTOR_ROT 0x2c0
++#define GAME_ADDR_0x8f6c60 0x8f273c
++#define GAME_ADDR_0x8f6c64 0x8f2740
++#define GAME_ADDR_0x8f6c88 0x8f2764
++#define GAME_ADDR_0x8f6d18 0x8f27f4
++#define GAME_ADDR_0x8f6d28 0x8f2804
++#define GAME_ADDR_0x8f6d7c 0x8f2858
++#define GAME_ADDR_0x8f6d98 0x8f2874
++#define GAME_ADDR_0x7a83f4 0x7ede7c
++#define GAME_ADDR_0x7a83f8 0x7ede80
++#define GAME_ADDR_0x7a83fc 0x7ede84
++#define GAME_ADDR_0x7a8400 0x7ede88
++#define GAME_ADDR_0x7a840c 0x7ede94
++#define GAME_ADDR_0x7a8410 0x7ede98
++#define GAME_ADDR_0x8f68b8 0x8f2394
++#define GAME_ADDR_0x8f68bc 0x8f2398
++#define GAME_ADDR_0x8f68cc 0x8f23a8
++#define GAME_ADDR_0x8f68d0 0x8f23ac
++#define GAME_ADDR_0xc630bc 0xcc3f68
++#define GAME_ADDR_0xc630c4 0xcc3f70
++#define GAME_ADDR_0xc630c8 0xcc3f74
++#define GAME_ADDR_0xe996ac 0xe7aa3c
++#define GAME_ADDR_0xe996b0 0xe7aa40
++#define GAME_ADDR_0xc630a4 0xcc3f50
++#define GAME_ADDR_0xc630a8 0xcc3f54
++#define GAME_ADDR_0xc630ac 0xcc3f58
++#define GAME_ADDR_0x69a18c 0x6ba86c
++#define GAME_ADDR_0x15ecb0c 0x1622bf0
++#define GAME_ADDR_0xe995c4 0xe7a954
++#define GAME_ADDR_0x4663f08 0x4728538
++#define GAME_ADDR_0x2aa4fa0 0x2b18000
++#define GAME_ADDR_0x453f648 0x4615d78
++#define GAME_ADDR_0x8f6cbc 0x8f2798
++#define GAME_OUTPUT_CALL_WORD 0x94000083u
+ #else
+ #define TOTK_GAME_VERSION "1.0.0"
+ #define TOTK_GAME_DIR "v0"
+diff --git a/games/totk/scripts/diag/save_position.py b/games/totk/scripts/diag/save_position.py
+index a2a1908..b446fc4 100644
+--- a/games/totk/scripts/diag/save_position.py
++++ b/games/totk/scripts/diag/save_position.py
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env python3
+-"""Inspect or change TOTK 1.0.0 / 1.1.2 player position in a *copy* of progress.sav.
++"""Inspect or change TOTK 1.0.0 / 1.1.2 / 1.2.1 player position in a *copy* of progress.sav.
++
++1.2.1 writes the 1.1.2 layout (2,307,656 bytes, header 0x0047E0F4; checked 2026-10-19).
+ 
+ Both World_PlayerPos and PlayerStatus.SavePos are raw X,Y,Z vectors; Y is
+ height. Both must be updated so world streaming follows the new position.
+@@ -21,7 +23,7 @@ SAVE_LAYOUTS = {(EXPECTED_SIZE, EXPECTED_HEADER), (2307656, 0x0047E0F4)}
+ 
+ def locate_all(data):
+     if len(data) < 8 or struct.unpack_from("<I", data)[0] != 0x01020304 or (len(data), struct.unpack_from("<I", data, 4)[0]) not in SAVE_LAYOUTS:
+-        raise ValueError("requires a verified TOTK 1.0.0 or 1.1.2 progress.sav layout")
++        raise ValueError("requires a verified TOTK 1.0.0 or 1.1.2 / 1.2.1 progress.sav layout")
+     offsets = {}
+     for index in range(0x28, len(data) - 8, 8):
+         tag, value = struct.unpack_from("<II", data, index)
+diff --git a/games/totk/scripts/game_version_test.py b/games/totk/scripts/game_version_test.py
+index c27a55a..8981a25 100644
+--- a/games/totk/scripts/game_version_test.py
++++ b/games/totk/scripts/game_version_test.py
+@@ -3,11 +3,12 @@ import argparse,re,struct
+ from pathlib import Path
+ ROOT=Path(__file__).resolve().parents[1]
+ def options():
+-    p=argparse.ArgumentParser();p.add_argument('--version',choices=('v0','v112'),default='v0');return p.parse_args()
++    p=argparse.ArgumentParser();p.add_argument('--version',choices=('v0','v112','v121'),default='v0');return p.parse_args()
+ def offsets(version):
+-    source=(ROOT/'runtime/game_version.h').read_text().split('#elif defined(TOTK_GAME_V112)',1)[1].split('#else',1)[0]
++    if version=='v0':return lambda value:value
++    source=(ROOT/'runtime/game_version.h').read_text().split(f'defined(TOTK_GAME_{version.upper()})',1)[1].split('\n#el',1)[0]
+     mapping={int(a,16):int(b,16) for a,b in re.findall(r'#define GAME_ADDR_(0x[0-9a-f]+) (0x[0-9a-f]+)',source)}
+-    def address(value):return mapping[value] if version=='v112' else value
++    def address(value):return mapping[value]
+     return address
+ def adrp_ldr(image,pc,ldr_pc):
+     a=struct.unpack_from('<I',image,pc)[0];b=struct.unpack_from('<I',image,ldr_pc)[0]
+diff --git a/games/totk/scripts/make_output_res_overlay.py b/games/totk/scripts/make_output_res_overlay.py
+index 96e365c..b1871fb 100644
+--- a/games/totk/scripts/make_output_res_overlay.py
++++ b/games/totk/scripts/make_output_res_overlay.py
+@@ -34,7 +34,7 @@ root = Path(__file__).resolve().parents[1]
+ parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ parser.add_argument('size', help='<width>x<height>, e.g. 2560x1440')
+ parser.add_argument('--output-root', type=Path, default=root / 'extracted/v0/romfs-patches-out')
+-parser.add_argument('--version', choices=('v0','v112','v143'), default='v0')
++parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
+ args = parser.parse_args()
+ version = args.version
+ if args.output_root == root / 'extracted/v0/romfs-patches-out': args.output_root = root / f'extracted/{version}/romfs-patches-out'
+diff --git a/games/totk/scripts/make_romfs_patches.py b/games/totk/scripts/make_romfs_patches.py
+index 39d0ee8..35c08e2 100644
+--- a/games/totk/scripts/make_romfs_patches.py
++++ b/games/totk/scripts/make_romfs_patches.py
+@@ -30,7 +30,7 @@ root = Path(__file__).resolve().parents[1]
+ parser = argparse.ArgumentParser(description=__doc__)
+ parser.add_argument('--output-dir', type=Path, default=root / 'extracted/v0/romfs-patches')
+ parser.add_argument('--capture-frame', type=float, default=0.0)
+-parser.add_argument('--version', choices=('v0','v112','v143'), default='v0')
++parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
+ args = parser.parse_args()
+ version = args.version
+ if args.output_dir == root / 'extracted/v0/romfs-patches': args.output_dir = root / f'extracted/{version}/romfs-patches'
+@@ -77,7 +77,7 @@ def flvi_keys(data, base):
+         pos += size
+     return out
+ 
+-ARCHIVE = 'UI/LayoutArchive/Common.Product.' + {'v0':'100','v112':'110','v143':'140'}[version] + '.Nin_NX_NVN.blarc.zs'
++ARCHIVE = 'UI/LayoutArchive/Common.Product.' + {'v0':'100','v112':'110','v121':'110','v143':'140'}[version] + '.Nin_NX_NVN.blarc.zs'
+ MEMBERS = {
+     'anim/ShortCutBG_00_In.bflan': ('C_CaptureBG_00', 'C_CaptureClearBG_00', 'P_CaptureClearBG_00'),
+     'anim/AutoBuilder_00_In.bflan': ('C_CaptureBG_00',),
+diff --git a/games/totk/scripts/prepare_romfs_backend.py b/games/totk/scripts/prepare_romfs_backend.py
+index 90dee7d..715db13 100644
+--- a/games/totk/scripts/prepare_romfs_backend.py
++++ b/games/totk/scripts/prepare_romfs_backend.py
+@@ -3,7 +3,7 @@
+ import argparse,hashlib,json,struct
+ from pathlib import Path
+ root=Path(__file__).resolve().parents[1]
+-parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v143'), default='v0');version=parser.parse_args().version
++parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0');version=parser.parse_args().version
+ out=root/('build' if version=='v0' else f'build/{version}');out.mkdir(parents=True,exist_ok=True)
+ folder=root/f'extracted/{version}/romfs';manifest=json.loads((folder/'index.json').read_text())
+ assert manifest['status']=='pass' and (folder/'romfs.bin').stat().st_size==manifest['romfs_size']
+diff --git a/games/totk/scripts/prepare_runtime.py b/games/totk/scripts/prepare_runtime.py
+index db525f1..6924544 100644
+--- a/games/totk/scripts/prepare_runtime.py
++++ b/games/totk/scripts/prepare_runtime.py
+@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(ROOT / 'third_party/d2r'))
+ from relr import decode_relr
+ parser = argparse.ArgumentParser(description=__doc__)
+-parser.add_argument('--version', choices=('v0','v112','v143'), default='v0')
++parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
+ version = parser.parse_args().version
+ OUT = ROOT / ('build' if version == 'v0' else f'build/{version}')
+ OUT.mkdir(parents=True, exist_ok=True)
+@@ -21,6 +21,8 @@ assert report['status'] == 'pass' and report['rom_version'] == version
+ if version == 'v112':
+     expected = 'd16accd1edbe15f94bb60bc0b45270a89e293aadc3d24ea833ba9c1ac47783c6'
+     assert report['module_file_sha256']['extracted/v112/exefs/main'] == expected, 'Unsupported 1.1.2 main image'
++if version == 'v121':
++    assert report['module_file_sha256']['extracted/v121/exefs/main'] == 'e5aa8d48e68cbb82ed4416c7b6b29a46fe4a998ee149d6dbf979164c628efcb6', 'Unsupported 1.2.1 main image'
+ if version == 'v143':
+     assert report['module_file_sha256']['extracted/v143/exefs/main'] == 'e84a90d551fed0824b4b74933b9c6d043c458521363a7cea58b2faca1822dc9e', 'Unsupported 1.4.3 main image'
+ modules = []
+diff --git a/games/totk/scripts/stage_test_profile.py b/games/totk/scripts/stage_test_profile.py
+index b85a07d..4c4b7b1 100644
+--- a/games/totk/scripts/stage_test_profile.py
++++ b/games/totk/scripts/stage_test_profile.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """Make a new diagnostic profile copy with a guarded saved spawn position.
+ 
+-Input must use a verified 1.0.0/1.1.2 save layout, which 1.4.3 can migrate when
++Input must use a verified 1.0.0/1.1.2 save layout (1.2.1 writes the 1.1.2 one), which 1.4.3 can migrate when
+ loading. This deliberately does not assume a layout for newly written saves.
+ Only the new copy is edited; existing destinations are always refused.
+ """
+diff --git a/games/totk/scripts/test_exclusive_windows.py b/games/totk/scripts/test_exclusive_windows.py
+index c7442e7..b02fe17 100644
+--- a/games/totk/scripts/test_exclusive_windows.py
++++ b/games/totk/scripts/test_exclusive_windows.py
+@@ -89,16 +89,37 @@ def run(original, patched, header, start, failure, seed, use_patch):
+             bytes(u.mem_read(SP, 128)), u.reg_read(UC_ARM64_REG_PC))
+ 
+ 
++# Every main has these windows: LDXR w17, [x16] / op / STXR w18 / CBZ w18 to a block outside the window.
++# 1.2.1 compiled the function around 1.1.2's 0x74cb68 without x18, so it has only one of them.
++WINDOWS = {'v0': [0x72AFDC, 0x7AA630], 'v112': [0x74CB68, 0x80B3A0], 'v121': [0x7FF694]}
++
++
++def x18_exit_windows(image, nso):
++    """All exclusive windows whose STXR status register is w18 and whose CBZ on it leaves the window."""
++    start, size = struct.unpack_from('<II', nso.read_bytes()[:0x100], 0x14)
++    words = memoryview(image)[start:start + size].cast('I')
++    found = []
++    for i in range(len(words) - 3):
++        a, c, d = words[i], words[i + 2], words[i + 3]
++        if a & 0xbfff7c00 != 0x885f7c00 or c & 0xbfe07c00 != 0x88007c00 or (c >> 16) & 31 != 18: continue
++        if d & 0x7e000000 != 0x34000000 or d & 31 != 18: continue
++        at = start + 4 * i
++        if not at <= nsoimg.direct_target(d, at + 12) < at + 16: found.append(at)
++    return found
++
++
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__)
+     ap.add_argument('directory', type=Path)
+     ap.add_argument('nso', type=Path)
+-    ap.add_argument('--version', choices=('v0','v112'), default='v0')
++    ap.add_argument('--version', choices=sorted(WINDOWS), default='v0')
+     args = ap.parse_args()
+     original = nsoimg.load(args.nso)
+     patched = (args.directory / 'main.patched.bin').read_bytes()
+     header = nsoimg.header(args.directory, 'main')
+-    starts = [0x72AFDC, 0x7AA630] if args.version == "v0" else [0x74CB68, 0x80B3A0]
++    starts = WINDOWS[args.version]
++    scanned = x18_exit_windows(original, args.nso)
++    assert scanned == starts, f'w18 external-exit windows in this main: {[hex(x) for x in scanned]}'
+     cases = 0
+     for start in starts:
+         for failure in [False, True]:
+diff --git a/games/totk/scripts/verify_boot.py b/games/totk/scripts/verify_boot.py
+index a2213e1..a6eb063 100644
+--- a/games/totk/scripts/verify_boot.py
++++ b/games/totk/scripts/verify_boot.py
+@@ -3,10 +3,10 @@
+ import argparse,hashlib,json,os,re,subprocess
+ from pathlib import Path
+ root=Path(__file__).resolve().parents[1]
+-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--version',choices=('v0','v112','v143'),default='v0');version=p.parse_args().version
++p=argparse.ArgumentParser(description=__doc__);p.add_argument('--version',choices=('v0','v112','v121','v143'),default='v0');version=p.parse_args().version
+ exe=root/('build/totk-native' if version=='v0' else f'build/totk-native-{version}')
+ out=root/('analysis' if version=='v0' else f'analysis/{version}-port')
+-checkpoint_pc={'v0':'0xe995c4','v112':'0xea7e14','v143':'0xbdb48c'}[version]
++checkpoint_pc={'v0':'0xe995c4','v112':'0xea7e14','v121':'0xe7a954','v143':'0xbdb48c'}[version]
+ expected=['ENTER nnosInitialize','RETURN nnosInitialize','ENTER nninitInitializeSdkModule','RETURN nninitInitializeSdkModule','ENTER nninitStartup','RETURN nninitStartup','ENTER main DT_INIT','RETURN main DT_INIT','ENTER subsdk0 DT_INIT','RETURN subsdk0 DT_INIT','ENTER sdk DT_INIT','RETURN sdk DT_INIT','ENTER nnMain']
+ trials=[]
+ for i in range(2):
+diff --git a/games/totk/scripts/verify_loader.py b/games/totk/scripts/verify_loader.py
+index 258528b..2546a46 100644
+--- a/games/totk/scripts/verify_loader.py
++++ b/games/totk/scripts/verify_loader.py
+@@ -6,9 +6,9 @@ import subprocess
+ import tempfile
+ from pathlib import Path
+ ROOT = Path(__file__).resolve().parents[1]
+-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--version',choices=('v0','v112'),default='v0');version=p.parse_args().version
+-exe = ROOT / ('build/totk-native' if version=='v0' else 'build/totk-native-v112')
+-out=ROOT/('analysis' if version=='v0' else 'analysis/v112-port')
++p=argparse.ArgumentParser(description=__doc__);p.add_argument('--version',choices=('v0','v112','v121'),default='v0');version=p.parse_args().version
++exe = ROOT / ('build/totk-native' if version=='v0' else f'build/totk-native-{version}')
++out=ROOT/('analysis' if version=='v0' else f'analysis/{version}-port')
+ run = subprocess.run([str(exe), f'rewritten/{version}', 'probe'], cwd=ROOT, capture_output=True, text=True, check=True)
+ data = json.loads(run.stdout)
+ assert data['status'] == 'pass' and data['calls'] == 4000 and data['threads'] == 4
+diff --git a/games/totk/scripts/verify_rewrites.py b/games/totk/scripts/verify_rewrites.py
+index 98df5fe..955e00f 100644
+--- a/games/totk/scripts/verify_rewrites.py
++++ b/games/totk/scripts/verify_rewrites.py
+@@ -32,7 +32,7 @@ def gate(command, output, environment):
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument('--version', choices=('v0','v112','v143'), default='v0')
++    parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
+     parser.add_argument('--collect-existing', action='store_true')
+     parser.add_argument('--jobs', type=int, default=2)
+     args = parser.parse_args()
+@@ -98,7 +98,8 @@ def main():
+                 or any(case['status'] != 'pass' or case['threads'] != 8 for case in atomic['cases'])
+                 or atomic['source_sha256'] != digest(ROOT / 'scripts/native_exclusive_probe.c')):
+             raise RuntimeError('Native 1.4.3 atomic-window checks did not pass')
+-    elif atomic['status'] != 'pass' or atomic['wrong_exit_negative_controls_detected'] != 2:
++    elif (atomic['status'] != 'pass' or not atomic['windows']
++          or atomic['wrong_exit_negative_controls_detected'] != len(atomic['windows'])):
+         raise RuntimeError('Atomic-window regression tests did not pass')
+     if native['status'] != 'pass' or native['completed_calls'] != 20000 or native['errors'] != 0:
+         raise RuntimeError('Native prepared-call hardware test did not pass')
+@@ -122,7 +123,7 @@ def main():
+                    ['structural_sites', 'semantic_sites', 'trials', 'effective_trials', 'both_fault_trials', 'detected_negative_controls']},
+         'scope': ['All listed module rewrite sites checked structurally.',
+                   'Full per-site differential verification uses the upstream deexcl model for exclusive accesses.',
+-                  'Real exclusive-success and injected-failure behavior separately checked on the two repaired windows.',
++                  'Real exclusive-success and injected-failure behavior separately checked on every w18 external-exit window (two in 1.0.0 and 1.1.2, one in 1.2.1).',
+                   'The prepared-call window requires no alternate entry at the original call word; known branches/functions/relocations are checked.',
+                   'Darwin TSD hardware checks are for this Mac; this is not a proof for all Apple devices.',
+                   '100 SDK system/timer gates are structurally checked; host service semantics are not implemented or tested.',
+diff --git a/games/totk/scripts/verify_romfs.py b/games/totk/scripts/verify_romfs.py
+index 8a80abf..0eaf283 100644
+--- a/games/totk/scripts/verify_romfs.py
++++ b/games/totk/scripts/verify_romfs.py
+@@ -3,8 +3,8 @@
+ import argparse,json,subprocess,tempfile,os
+ from pathlib import Path
+ root=Path(__file__).resolve().parents[1]
+-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--version',choices=('v0','v112'),default='v0');version=p.parse_args().version
+-exe=root/('build/totk-native' if version=='v0' else 'build/totk-native-v112');out=root/('analysis' if version=='v0' else 'analysis/v112-port')
++p=argparse.ArgumentParser(description=__doc__);p.add_argument('--version',choices=('v0','v112','v121'),default='v0');version=p.parse_args().version
++exe=root/('build/totk-native' if version=='v0' else f'build/totk-native-{version}');out=root/('analysis' if version=='v0' else f'analysis/{version}-port')
+ run=subprocess.run([str(exe),f'rewritten/{version}','probe-fs'],cwd=root,capture_output=True,text=True,check=True)
+ report=json.loads(run.stdout);files=json.loads((root/f'extracted/{version}/romfs/index.json').read_text())['files']
+ digest=0;count=0
+diff --git a/games/totk/scripts/verify_vertex_counter.py b/games/totk/scripts/verify_vertex_counter.py
+index 4f09a45..885d7e2 100644
+--- a/games/totk/scripts/verify_vertex_counter.py
++++ b/games/totk/scripts/verify_vertex_counter.py
+@@ -1,10 +1,12 @@
+ #!/usr/bin/env python3
+-"""Verify the exact local v112/v143 visibility shader and its atomic side effect on Metal."""
++"""Verify the exact local v112/v143 visibility shader and its atomic side effect on Metal.
++1.2.1 runs the very same shader as 1.1.2 (same key and Maxwell bytes, seen in 1.2.1 field sessions on 2026-10-19)."""
+ import argparse, hashlib, json, os, subprocess
+ from pathlib import Path
+ ROOT=Path(__file__).resolve().parents[1]
+ CASES={
+  'v112':('b1e4d0906d1658f64825f570ed6a2abd08ceeec82d537cd3a5fc1c17f38fb238-641742ac59e3','eabe9fdd6fc737b8414e94cc3e14ec0031ab3a156511953abe5e3a04128524ad','vertex'),
++ 'v121':('b1e4d0906d1658f64825f570ed6a2abd08ceeec82d537cd3a5fc1c17f38fb238-641742ac59e3','eabe9fdd6fc737b8414e94cc3e14ec0031ab3a156511953abe5e3a04128524ad','vertex'),
+  'v143':('1eee2726aae7493ec0506b96a54c89cb18bf6bd98f64c29641aa8e67ed642326-641742ac59e3','f5f4d23149565acd852f6b7091f64cc8cb3aa019ccb33ba3f88ced62c6d1ff7b','instance')}
+ def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
+ def main():
+diff --git a/tests/test_updates.py b/tests/test_updates.py
+index 28707cd..ee7d613 100644
+--- a/tests/test_updates.py
++++ b/tests/test_updates.py
+@@ -135,7 +135,7 @@ class Updates(unittest.TestCase):
+         self.assertFalse(list(self.root.glob('update-merge-*')))
+ 
+     def test_bundle_contains_only_selected_game_version(self):
+-        for version, display in (('v112', '1.1.2'), ('v143', '1.4.3')):
++        for version, display in (('v112', '1.1.2'), ('v121', '1.2.1'), ('v143', '1.4.3')):
+             with self.subTest(version=version):
+                 tree=self.root/version;out=self.root/f'{version}.app'
+                 files=[f'build/totk-native-{version}','build/pso_manifest.tsv','build/spirv-cross/spirv-cross',
+diff --git a/docs/sequoia-v121.md b/docs/sequoia-v121.md
+new file mode 100644
+index 0000000..09919f0
+--- /dev/null
++++ b/docs/sequoia-v121.md
+@@ -0,0 +1,31 @@
++# TOTK 1.2.1 on macOS Sequoia
++
++This checkout combines the community `m3-macos15` branch at
++`f71ea7b56eb1f7064d5e753428cc6b05a124241b` with the upstream 1.2.1 support from
++`2db612bd7a82db2d94e3929556b71f0200f4b08c`.
++
++The 1.2.1 ExeFS and rewritten module hashes are upstream's published hashes.
++Version offsets, runtime tables, RomFS overlays and the launcher select `v121`.
++The added `runtime-v121-m3` target uses the community Metal 3 graphics backend and
++targets macOS 15.0. Build with `TOTK_M3=1`, the 1.0.0 base and a separate 1.2.1
++update.
++
++Updated builds use the update's complete ExeFS and validate its NPDM. The base
++provides RomFS; its executable module hashes and the base and merged RomFS hashes
++are still checked. The unused base NPDM can differ between NSP and cartridge
++sources and is not loaded by an updated build.
++
++`assets/shared-fonts-22.1.0.json` adds one complete, pinned firmware font set.
++The source data NCAs passed their FS-header and six-level IVFC checks; every
++decoded font passed all sfnt table checksums and the whole-font checksum. The
++original font set remains supported. Mixed sets and unknown bytes are rejected;
++the runtime also checks each bundled font's hash.
++
++Build intermediates and the output App must be outside this source checkout.
++The build requires Python 3.14, Xcode command line tools, and Homebrew `opus` and
++`libvpx`. No game data, font data or keys belong in this source checkout.
++
++After signing and verifying the freshly built local App, the packager removes
++an inherited quarantine attribute from that bundle before its first launch.
++This fixes the build host's `0081;00000000;;` marker rejecting an otherwise
++valid local ad-hoc signature.
+diff --git a/games/totk/assets/expected-v1.2.1.json b/games/totk/assets/expected-v1.2.1.json
+new file mode 100644
+index 0000000..1d56fef
+--- /dev/null
++++ b/games/totk/assets/expected-v1.2.1.json
+@@ -0,0 +1,30 @@
++{
++  "_comment": "Verified 1.2.1 outputs from base 1.0.0 plus the cumulative 1.2.1 update. Hashes only; no game data.",
++  "title_id": "0100F2C0115B6000",
++  "version": 393216,
++  "display_version": "1.2.1",
++  "exefs_sha256": {
++    "rtld": "28317605926caa40a5cbee3e3cb290c65783b4d9f8c3697b43ca41ab2866a44d",
++    "subsdk0": "9d04c98997977e99c12a48a2dbfd3064b8da96b5152e0119064957a43f6c3f99",
++    "main.npdm": "7df836b8b2608a545f215ae7cf8f9abdadc0c5d6dda98e4ab5f63f408235af39",
++    "sdk": "91573d4444d0dcd07080db78fece2b098b76080d77cdb2e1d301a2a41d7c4eea",
++    "main": "e5aa8d48e68cbb82ed4416c7b6b29a46fe4a998ee149d6dbf979164c628efcb6"
++  },
++  "rewritten_sha256": {
++    "main.patched.bin": "b7a2cc7e3465c4f11cd23f34cb38e037cf51d1d18310206f03b86c160ff2dbd0",
++    "sdk.patched.bin": "01402184940ea2b308005f30a5be087244fb7da739976a1bde084822604b1ef8",
++    "subsdk0.patched.bin": "43734d4172885a17088754227b7fc66b13c5f2421679c37dac23a4aa3dc84459"
++  },
++  "romfs": {
++    "size": 17052047360,
++    "sha256": "c2beb1c2a732489200d0949d4ad12f3ed836ae86495c4acd6c217c6d53937c11"
++  },
++  "shared_fonts_sha256": {
++    "standard": "823913c9d80807979381e327846466f561f31ba1842cea8f7fedc5ad7d45d2ad",
++    "chinese-simplified": "7e95d45f43c6f35ee0c7bd8ea446675d8ab0390e18fd2844abcac11d2bff7389",
++    "chinese-simplified-extension": "0f90d45b741e9da7700c416eb2b51996b458c3e4fb3c3291740b758c298e7a25",
++    "chinese-traditional": "9d59b74e59a2dc92296d6bebad7cce791ba94688bd436304aaae174a58bd7457",
++    "korean": "5a4e694782ead5ddcbc0a226aab24362e2d641ca33bac7bdf8cda36ff157c9e8",
++    "nintendo-extension": "f9f62e025c9bbe0e9ae25a54ba5011202b1e3a3f3c33b2d876c40aff6174af68"
++  }
++}
+diff --git a/games/totk/assets/shared-fonts-22.1.0.json b/games/totk/assets/shared-fonts-22.1.0.json
+new file mode 100644
+index 0000000..fde40a9
+--- /dev/null
++++ b/games/totk/assets/shared-fonts-22.1.0.json
+@@ -0,0 +1,11 @@
++{
++  "_comment": "Firmware 22.1.0 font set from user-supplied NCAs. All NCA FS headers and six IVFC levels verified. Decoded sfnt tables and whole-font checksums verified on 2026-10-29. Hashes only; no font data.",
++  "shared_fonts_sha256": {
++    "standard": "d8f0b7510ea03e2a7e7552562076ce374b4bd2c9c9c1c79466f342758c046413",
++    "chinese-simplified": "a04eb490283d8393b2c49c52e315132461d790ac73996cb43ac869ce72003938",
++    "chinese-simplified-extension": "d87f8c101f852340c068ceb040565784acb19926347598d219ed57cf51bff5a9",
++    "chinese-traditional": "9d59b74e59a2dc92296d6bebad7cce791ba94688bd436304aaae174a58bd7457",
++    "korean": "2c03d70de164671c1f33caca76120e6c73223bc73a41f90605e151b04e7eb68a",
++    "nintendo-extension": "f9f62e025c9bbe0e9ae25a54ba5011202b1e3a3f3c33b2d876c40aff6174af68"
++  }
++}
+diff --git a/games/totk/scripts/map_version_sites.py b/games/totk/scripts/map_version_sites.py
+new file mode 100644
+index 0000000..7e1dce8
+--- /dev/null
++++ b/games/totk/scripts/map_version_sites.py
+@@ -0,0 +1,303 @@
++#!/usr/bin/env python3
++"""Find where runtime/game_version.h's main offsets moved to in another game version.
++
++Each code site is matched by the instructions around it in a known version (by default 1.1.2, then 1.0.0):
++PC-relative fields (B/BL, B.cond, CBZ/TBZ, ADR/ADRP, LDR literal) and the page offsets that follow an ADRP
++are masked; the window grows until exactly one place in the new main matches. Data sites are found through
++code that addresses them (ADRP + LDR/ADD) or, for a GOT slot, through the import's JUMP_SLOT relocation.
++The original instruction words at every code site are printed for both versions: runtime patches still
++check them before writing, so a moved site with a different word needs a new expected value, not just an offset.
++
++usage: map_version_sites.py --to v121 [--root <tree with extracted/<version>/exefs/main>] [--from v112]
++Prints a report and, with --header, the #define lines for a new game_version.h block. Reads only local images.
++"""
++import argparse
++import re
++import struct
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / 'third_party/d2r'))
++import nsoimg  # noqa: E402
++
++WINDOWS = (6, 12, 24, 48, 96)       # words on each side of the site
++FUZZY_MISSES = 3                    # a near match may differ in this many words (reported, never chosen)
++
++
++def header_blocks(path):
++    """{version: {'addr': {v0: offset}, 'name': value}} for every block of game_version.h (v0 = the #else block)."""
++    blocks, current = {}, None
++    for line in path.read_text().splitlines():
++        m = re.match(r'#(?:el)?if defined\(TOTK_GAME_(V\d+)\)', line)
++        if m: current = blocks.setdefault(m[1].lower(), {'addr': {}}); continue
++        if line.startswith('#else'): current = blocks.setdefault('v0', {'addr': {}}); continue
++        if line.startswith('#endif'): current = None; continue
++        if current is None: continue
++        m = re.match(r'#define GAME_ADDR_(0x[0-9a-f]+) (0x[0-9a-f]+)', line)
++        if m: current['addr'][int(m[1], 16)] = int(m[2], 16); continue
++        m = re.match(r'#define (GAME_\w+) (\S+)', line)
++        if m: current[m[1]] = m[2]
++    return blocks
++
++
++def segments(path):
++    d = path.read_bytes()[:0x100]
++    return [struct.unpack_from('<III', d, 0x10 + i * 0x10)[1:] for i in range(3)]   # (memory offset, size)
++
++
++def mask_of(word, adrp_regs):
++    """(mask, base register written by an ADRP or None) for one instruction word."""
++    if word & 0x7c000000 == 0x14000000: return 0xfc000000, None                 # B, BL
++    if word & 0xff000010 == 0x54000000: return 0xff00001f, None                 # B.cond
++    if word & 0x7e000000 == 0x34000000: return 0xff00001f, None                 # CBZ, CBNZ
++    if word & 0x7e000000 == 0x36000000: return 0xfff8001f, None                 # TBZ, TBNZ
++    if word & 0x1f000000 == 0x10000000: return 0x9f00001f, word & 31            # ADR, ADRP
++    if word & 0x3b000000 == 0x18000000: return 0xff00001f, None                 # LDR literal
++    base = (word >> 5) & 31
++    if base in adrp_regs:
++        if word & 0x7f800000 == 0x11000000: return 0xffc003ff, None             # ADD immediate (page offset)
++        if word & 0x3b000000 == 0x39000000: return 0xffc003ff, None             # LDR/STR unsigned offset
++    return 0xffffffff, None
++
++
++def pattern(image, start, count):
++    words = struct.unpack_from(f'<{count}I', image, start)
++    out, adrp_regs = [], set()
++    for word in words:
++        mask, written = mask_of(word, adrp_regs)
++        if written is not None: adrp_regs.add(written)
++        elif mask == 0xffffffff and word & 0x1f != 0x1f:
++            adrp_regs.discard(word & 31)    # most writes to Rd end an ADRP's page register (conservative)
++        out.append((word & mask, mask))
++    return out
++
++
++class Text:
++    def __init__(self, image, start, size):
++        self.image, self.start, self.end = image, start, start + size
++        self.words = memoryview(image)[start:self.end].cast('I')
++        self.counts = {}
++
++    def count(self, value):
++        if value not in self.counts: self.counts[value] = self.image.count(struct.pack('<I', value), self.start, self.end)
++        return self.counts[value]
++
++    def matches(self, pat, limit=4):
++        """Offsets in the text where every masked word of pat matches (at most limit of them)."""
++        anchors = [i for i, (_, m) in enumerate(pat) if m == 0xffffffff]
++        if not anchors: return []
++        anchor = min(anchors, key=lambda i: self.count(pat[i][0]))
++        needle, found, at = struct.pack('<I', pat[anchor][0]), [], self.start
++        while len(found) <= limit:
++            at = self.image.find(needle, at, self.end)
++            if at < 0: break
++            if (at - self.start) % 4 == 0:
++                base = (at - self.start) // 4 - anchor
++                if base >= 0 and base + len(pat) <= len(self.words) and \
++                        all(self.words[base + i] & m == v for i, (v, m) in enumerate(pat)):
++                    found.append(self.start + 4 * base)
++            at += 1
++        return found
++
++    def near(self, pat, misses):
++        """Places that match all but at most misses words (anchored on each fully masked word in turn)."""
++        scores = {}
++        for i, (v, m) in enumerate(pat):
++            if m != 0xffffffff: continue
++            needle, at = struct.pack('<I', v), self.start
++            for _ in range(200):
++                at = self.image.find(needle, at, self.end)
++                if at < 0: break
++                if (at - self.start) % 4 == 0:
++                    base = (at - self.start) // 4 - i
++                    if 0 <= base and base + len(pat) <= len(self.words) and base not in scores:
++                        scores[base] = sum(self.words[base + j] & mm != vv for j, (vv, mm) in enumerate(pat))
++                at += 1
++        return sorted((s, self.start + 4 * b) for b, s in scores.items() if s <= misses)
++
++
++def map_code(site, sources, target):
++    """(new offset, how, source version) for a code site; sources = [(version, image, offset in it)]."""
++    for half in WINDOWS:
++        for version, image, offset in sources:
++            pat = pattern(image, offset - 4 * half, 2 * half + 1)
++            found = target.matches(pat)
++            if len(found) == 1: return found[0] + 4 * half, f'unique match of +-{half} words', version
++            if not found: break     # a wider window will not match either
++    near = []
++    for version, image, offset in sources:
++        for misses, at in target.near(pattern(image, offset - 4 * 24, 49), FUZZY_MISSES):
++            near.append(f'{version}: {misses} words differ at 0x{at + 4 * 24:x}')
++    return None, 'no unique match' + (' (near: ' + '; '.join(near[:4]) + ')' if near else ''), None
++
++
++def adrp_target(image, at):
++    """The address an ADRP at `at` plus the next LDR/ADD on its register (within 8 words) refers to, or None."""
++    a = struct.unpack_from('<I', image, at)[0]
++    if a & 0x9f000000 != 0x90000000: return None
++    reg = a & 31
++    imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)
++    page = (at & ~4095) + (((imm ^ (1 << 20)) - (1 << 20)) << 12)
++    for k in range(1, 9):
++        w = struct.unpack_from('<I', image, at + 4 * k)[0]
++        if (w >> 5) & 31 != reg: continue
++        if w & 0x7f800000 == 0x11000000: return page + ((w >> 10) & 0xfff)           # ADD (64-bit and 32-bit)
++        if w & 0x3b000000 == 0x39000000: return page + ((w >> 10) & 0xfff) * (1 << (w >> 30))
++        return None
++    return None
++
++
++def data_refs(image, text, address):
++    """Text offsets of ADRP instructions that address `address`."""
++    refs, page = [], address & ~4095
++    words = memoryview(image)[text.start:text.end].cast('I')
++    for i, a in enumerate(words):
++        if a & 0x9f000000 != 0x90000000: continue
++        at = text.start + 4 * i
++        imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)
++        if (at & ~4095) + (((imm ^ (1 << 20)) - (1 << 20)) << 12) == page and adrp_target(image, at) == address:
++            refs.append(at)
++    return refs
++
++
++def map_data(site_from, image_from, text_from, target, image_to):
++    """Map a data address through the code that addresses it: every code reference that maps must agree."""
++    votes, mapped = {}, 0
++    for ref in data_refs(image_from, text_from, site_from)[:40]:
++        new, _, _ = map_code(ref, [('from', image_from, ref)], target)
++        if new is None: continue
++        value = adrp_target(image_to, new)
++        if value is None: continue
++        mapped += 1
++        votes[value] = votes.get(value, 0) + 1
++    if len(votes) == 1: return next(iter(votes)), f'{mapped} code references agree'
++    return None, f'code references disagree or none mapped: {votes}'
++
++
++def map_by_callers(site_from, image_from, text_from, target, image_to):
++    """Map a function entry through its direct callers (BL / B): every caller that maps must branch to one place."""
++    votes, mapped = {}, 0
++    words = memoryview(image_from)[text_from.start:text_from.end].cast('I')
++    callers = [text_from.start + 4 * i for i, w in enumerate(words)
++               if w & 0x7c000000 == 0x14000000 and nsoimg.direct_target(w, text_from.start + 4 * i) == site_from]
++    for call in callers[:40]:
++        new, _, _ = map_code(call, [('from', image_from, call)], target)
++        if new is None: continue
++        word = struct.unpack_from('<I', image_to, new)[0]
++        dest = nsoimg.direct_target(word, new) if word & 0x7c000000 == 0x14000000 else None
++        if dest is None: continue
++        mapped += 1
++        votes[dest] = votes.get(dest, 0) + 1
++    if len(votes) == 1: return next(iter(votes)), f'{mapped} of {len(callers)} callers agree'
++    return None, f'callers: {len(callers)}, targets {dict((hex(k), v) for k, v in votes.items())}'
++
++
++def import_slots(image):
++    """{GOT slot: imported symbol name} from the JUMP_SLOT relocations."""
++    return {where: name for where, kind, name, _, _ in nsoimg.relocs(image) if kind == 1026 and name}
++
++
++def stub_slot(image, at):
++    """The GOT slot a PLT stub (adrp x16 / ldr x17, [x16, #o] / add x16 / br x17) at `at` jumps through, or None."""
++    a, b, _, d = struct.unpack_from('<IIII', image, at)
++    if a & 0x9f00001f != 0x90000010 or b & 0xffc003ff != 0xf9400211 or d != 0xd61f0220: return None
++    imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)
++    return (at & ~4095) + (((imm ^ (1 << 20)) - (1 << 20)) << 12) + ((b >> 10) & 0xfff) * 8
++
++
++def plt_stubs(image, text, slot):
++    return [at for at in range(text.end - 0x20000, text.end - 12, 4) if stub_slot(image, at) == slot]
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('--to', required=True, help='version folder to map into, e.g. v121')
++    ap.add_argument('--from', dest='source', default='v112', help='known version whose instructions are searched for')
++    ap.add_argument('--root', type=Path, default=ROOT, help='tree with extracted/<version>/exefs/main')
++    ap.add_argument('--header', action='store_true', help='print #define lines for the new block')
++    ap.add_argument('--code', default='', help='only map these comma-separated code offsets of the --from version')
++    args = ap.parse_args()
++    if args.code: return map_extra(args, [int(x, 16) for x in args.code.split(',')])
++    blocks = header_blocks(ROOT / 'runtime/game_version.h')
++    sites = list(blocks['v0']['addr'])
++    known = blocks[args.source]['addr'] if args.source != 'v0' else {k: k for k in sites}
++    expected = blocks.get(args.to, {}).get('addr') if args.to != 'v0' else {k: k for k in sites}
++    images, texts = {}, {}
++    for version in sorted({'v0', args.source, args.to}):
++        path = args.root / f'extracted/{version}/exefs/main'
++        images[version] = nsoimg.load(path)
++        start, size = segments(path)[0]
++        texts[version] = Text(images[version], start, size)
++    image_from, text_from = images[args.source], texts[args.source]
++    target, image_to = texts[args.to], images[args.to]
++    imports_from = import_slots(image_from)
++    slots_to = {name: where for where, name in import_slots(image_to).items()}
++    results, failed, disagree = {}, 0, 0
++    for site in sites:
++        source_site = known.get(site)
++        if source_site is None:
++            print(f'0x{site:x}: no {args.source} address in game_version.h'); failed += 1; results[site] = None; continue
++        how, words = '', ''
++        stub = stub_slot(image_from, source_site) if text_from.start <= source_site < text_from.end else None
++        if source_site in imports_from:                              # a GOT slot of an imported function
++            name = imports_from[source_site]
++            new, how = slots_to.get(name), f'GOT slot of {name}'
++        elif stub in imports_from:                                   # a PLT stub of an imported function
++            name = imports_from[stub]
++            found = plt_stubs(image_to, target, slots_to.get(name, -1))
++            new = found[0] if len(found) == 1 else None
++            how = f'PLT stub of {name}' + ('' if new is not None else f' (stubs {found})')
++        elif text_from.start <= source_site < text_from.end:         # code
++            sources = [(args.source, image_from, source_site)]
++            if args.source != 'v0': sources.append(('v0', images['v0'], site))
++            new, how, used = map_code(site, sources, target)
++            if new is None:
++                new, via = map_by_callers(source_site, image_from, text_from, target, image_to)
++                how += f'; by callers: {via}'
++                used = args.source
++            if new is not None:
++                a = struct.unpack_from('<I', image_from, source_site)[0]
++                b = struct.unpack_from('<I', image_to, new)[0]
++                how += f' from {used}'
++                words = f'  word {a:08x} -> {b:08x}' + ('' if a == b else '  (DIFFERENT)')
++        else:                                                        # data addressed by code
++            new, how = map_data(source_site, image_from, text_from, target, image_to)
++        results[site] = new
++        failed += new is None
++        note = '  <-- NOT FOUND' if new is None else ''
++        if new is not None and expected and site in expected and expected[site] != new:
++            note = f'  <-- DISAGREES with game_version.h (0x{expected[site]:x})'; disagree += 1
++        elif new is not None and expected and site in expected:
++            note = '  (agrees with game_version.h)'
++        new_text = f'0x{new:x}' if new is not None else '-'
++        print(f'0x{site:x} ({args.source} 0x{source_site:x}) -> {new_text}: {how}{words}{note}')
++    if args.header:
++        for site in sites:
++            if results[site] is not None: print(f'#define GAME_ADDR_0x{site:x} 0x{results[site]:x}')
++    print(f'{len(sites) - failed} of {len(sites)} sites mapped' + (f', {failed} not found' if failed else '')
++          + (f', {disagree} disagree with game_version.h' if disagree else ''))
++    return 1 if failed or disagree else 0
++
++
++def map_extra(args, offsets):
++    """Map arbitrary code offsets of the --from version (e.g. the atomic windows the rewrite tests run)."""
++    images, texts = {}, {}
++    for version in sorted({args.source, args.to}):
++        path = args.root / f'extracted/{version}/exefs/main'
++        images[version] = nsoimg.load(path)
++        start, size = segments(path)[0]
++        texts[version] = Text(images[version], start, size)
++    failed = 0
++    for offset in offsets:
++        new, how, _ = map_code(offset, [(args.source, images[args.source], offset)], texts[args.to])
++        a = struct.unpack_from('<4I', images[args.source], offset)
++        b = struct.unpack_from('<4I', images[args.to], new) if new is not None else ()
++        failed += new is None
++        print(f'0x{offset:x} -> ' + (f'0x{new:x}' if new is not None else '-') + f': {how}  words '
++              + ' '.join(f'{w:08x}' for w in a) + ' -> ' + ' '.join(f'{w:08x}' for w in b))
++    return 1 if failed else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

@@ -1,0 +1,12 @@
+{
+  "totk121": {
+    "patch_applies_to_pinned_base": true,
+    "restored_files_match_current_source": true,
+    "changed_files": 22
+  },
+  "botw160": {
+    "patch_applies_to_pinned_base": true,
+    "restored_files_match_current_source": true,
+    "changed_files": 16
+  }
+}
